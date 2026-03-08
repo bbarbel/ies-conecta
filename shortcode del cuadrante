@@ -1,0 +1,249 @@
+function iesc_cuadrante_shortcode($atts) {
+
+    $atts = shortcode_atts(array(
+        'edificio_id' => 1,
+    ), $atts, 'cuadrante_reservas');
+
+    $edificio_id = (int)$atts['edificio_id'];
+
+    if (!is_user_logged_in()) {
+        return '<h3>Debes iniciar sesión con tu cuenta corporativa.</h3>';
+    }
+
+    $upn = iesc_get_current_upn();
+
+    if ($upn === '' || iesc_usuario_tiene_grupo($upn, 'GRP_ALUMNADO')) {
+        return '<h3>Esta página de reservas solo está disponible para el profesorado.</h3>';
+    }
+
+    if ($edificio_id > 0 && !iesc_usuario_tiene_permiso_edificio($upn, $edificio_id)) {
+        return '<h3>No tienes permiso para reservar en este edificio.</h3>';
+    }
+
+    $fecha = isset($_GET['fecha']) ? sanitize_text_field($_GET['fecha']) : iesc_today_ymd();
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fecha)) {
+        $fecha = iesc_today_ymd();
+    }
+
+    $mysqli = iesc_get_mysqli();
+    if (!$mysqli) return 'Error conexión base de datos de reservas.';
+
+    $stmt = $mysqli->prepare("
+        SELECT id, nombre
+        FROM recursos
+        WHERE edificio_id = ?
+        ORDER BY nombre
+    ");
+    if (!$stmt) {
+        $mysqli->close();
+        return 'Error al cargar recursos.';
+    }
+
+    $stmt->bind_param("i", $edificio_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+
+    $recursos = array();
+    while ($row = $res->fetch_assoc()) {
+        $recursos[(int)$row['id']] = $row['nombre'];
+    }
+    $stmt->close();
+
+    if (empty($recursos)) {
+        $mysqli->close();
+        return 'No hay recursos para este edificio.';
+    }
+
+    $recursos_permitidos = iesc_get_recursos_permitidos_usuario($mysqli, $upn);
+
+    $periodos = array();
+    $res2 = $mysqli->query("SELECT id, nombre, hora_inicio, hora_fin FROM periodos ORDER BY id");
+    if ($res2) {
+        while ($row = $res2->fetch_assoc()) {
+            $periodos[(int)$row['id']] = $row;
+        }
+    }
+
+    if (empty($periodos)) {
+        $mysqli->close();
+        return 'No hay periodos configurados.';
+    }
+
+    $stmt2 = $mysqli->prepare("
+        SELECT rf.recurso_id, rf.periodo_id, u.display_name, r.estado
+        FROM reserva_franjas rf
+        JOIN reservas r    ON r.id = rf.reserva_id
+        JOIN recursos rec  ON rec.id = rf.recurso_id
+        JOIN usuarios_ad u ON u.id = r.usuario_id
+        WHERE rf.fecha = ?
+          AND rec.edificio_id = ?
+          AND r.estado IN ('pendiente','confirmada','validada')
+    ");
+    if (!$stmt2) {
+        $mysqli->close();
+        return 'Error al cargar reservas.';
+    }
+
+    $stmt2->bind_param("si", $fecha, $edificio_id);
+    $stmt2->execute();
+    $res3 = $stmt2->get_result();
+
+    $ocupacion = array();
+    while ($row = $res3->fetch_assoc()) {
+        $p = (int)$row['periodo_id'];
+        $r = (int)$row['recurso_id'];
+        $ocupacion[$p][$r] = array(
+            'profesor' => $row['display_name'],
+            'estado'   => $row['estado'],
+        );
+    }
+    $stmt2->close();
+    $mysqli->close();
+
+    $mostrar_form_reserva = false;
+    $form_fecha      = $fecha;
+    $form_periodo_id = 0;
+    $form_recurso_id = 0;
+
+    if (isset($_GET['accion']) && $_GET['accion'] === 'reservar') {
+        $get_edif = isset($_GET['edificio_id']) ? (int)$_GET['edificio_id'] : 0;
+        if ($get_edif === $edificio_id) {
+            $mostrar_form_reserva = true;
+            $form_fecha      = isset($_GET['fecha']) ? sanitize_text_field($_GET['fecha']) : $fecha;
+            $form_periodo_id = isset($_GET['periodo']) ? (int)$_GET['periodo'] : 0;
+            $form_recurso_id = isset($_GET['recurso']) ? (int)$_GET['recurso'] : 0;
+        }
+    }
+
+    $ahora_dt  = iesc_now_dt();
+    $hoy_ymd   = $ahora_dt->format('Y-m-d');
+    $ahora_str = $ahora_dt->format('H:i:s');
+
+    ob_start();
+    ?>
+    <div class="iesc-cuadrante-wrapper" style="margin-bottom:30px;">
+        <style>
+            .iesc-header-sin-permiso { background:#ffcdd2 !important; color:#900 !important; }
+            .iesc-celda-sin-permiso  { background:#ffcdd2 !important; color:#900 !important; cursor:not-allowed; opacity:0.95; }
+            .iesc-celda-sin-permiso a { pointer-events:none; color:#900 !important; text-decoration:none; }
+            .iesc-leyenda-permisos { margin-top:8px; font-size:0.9em; }
+            .iesc-debug-hora { font-size:0.8em; color:#666; margin-bottom:5px; }
+        </style>
+
+        <div class="iesc-debug-hora">
+            Hora actual usada por el sistema (Europe/Madrid): <strong><?php echo esc_html($hoy_ymd . ' ' . $ahora_str); ?></strong>
+        </div>
+
+        <form method="get" style="margin-bottom:10px;">
+            <input type="hidden" name="edificio_id" value="<?php echo esc_attr($edificio_id); ?>">
+            Fecha:
+            <input type="date" name="fecha" value="<?php echo esc_attr($fecha); ?>">
+            <button type="submit">Ver</button>
+        </form>
+
+        <?php if ($mostrar_form_reserva && $form_periodo_id && $form_recurso_id && isset($periodos[$form_periodo_id]) && isset($recursos[$form_recurso_id])): ?>
+            <div style="border:1px solid #ccc; padding:10px; margin-bottom:15px;">
+                <h4>Confirmar reserva</h4>
+                <p>
+                    Fecha: <strong><?php echo esc_html($form_fecha); ?></strong><br>
+                    Periodo: <strong><?php echo esc_html($periodos[$form_periodo_id]['nombre']); ?></strong><br>
+                    Recurso: <strong><?php echo esc_html($recursos[$form_recurso_id]); ?></strong>
+                </p>
+                <form method="post">
+                    <?php wp_nonce_field('iesc_hacer_reserva', 'iesc_reserva_nonce'); ?>
+                    <input type="hidden" name="fecha" value="<?php echo esc_attr($form_fecha); ?>">
+                    <input type="hidden" name="periodo_id" value="<?php echo esc_attr($form_periodo_id); ?>">
+                    <input type="hidden" name="recurso_id" value="<?php echo esc_attr($form_recurso_id); ?>">
+                    <input type="hidden" name="edificio_id" value="<?php echo esc_attr($edificio_id); ?>">
+                    <button type="submit">Confirmar reserva</button>
+                </form>
+            </div>
+        <?php endif; ?>
+
+        <table border="1" cellpadding="5" style="border-collapse:collapse; width:100%;">
+            <tr style="background:#f0f0f0;">
+                <th>Periodo</th>
+                <?php foreach ($recursos as $rid => $rec): ?>
+                    <?php
+                    $puede_recurso = !empty($recursos_permitidos[$rid]);
+                    $th_class = $puede_recurso ? '' : ' class="iesc-header-sin-permiso"';
+                    ?>
+                    <th<?php echo $th_class; ?>><?php echo esc_html($rec); ?></th>
+                <?php endforeach; ?>
+            </tr>
+
+            <?php foreach ($periodos as $pid => $per): ?>
+                <tr>
+                    <td>
+                        <strong><?php echo esc_html($per['nombre']); ?></strong><br>
+                        <small><?php echo esc_html(substr($per['hora_inicio'], 0, 5) . ' - ' . substr($per['hora_fin'], 0, 5)); ?></small>
+                    </td>
+
+                    <?php foreach ($recursos as $rid => $rec): ?>
+                        <?php
+                        $celda = isset($ocupacion[$pid][$rid]) ? $ocupacion[$pid][$rid] : null;
+                        $puede_recurso = !empty($recursos_permitidos[$rid]);
+                        $td_class = '';
+                        $contenido = '';
+                        $color = '#fff';
+
+                        if ($celda) {
+                            if ($celda['estado'] === 'confirmada') {
+                                $color = '#ffcdd2';
+                            } elseif ($celda['estado'] === 'validada') {
+                                $color = '#c8e6c9';
+                            } else {
+                                $color = '#ffe082';
+                            }
+                            $contenido = esc_html($celda['profesor']);
+                        } else {
+                            if (!$puede_recurso) {
+                                $color = '#ffcdd2';
+                                $contenido = 'No permitido';
+                                $td_class = ' class="iesc-celda-sin-permiso"';
+                            } else {
+                                $es_pasado = false;
+
+                                if ($fecha < $hoy_ymd) {
+                                    $es_pasado = true;
+                                } elseif ($fecha === $hoy_ymd) {
+                                    $dt_fin_celda = iesc_build_dt($fecha, $per['hora_fin']);
+                                    if ($dt_fin_celda && $dt_fin_celda <= $ahora_dt) {
+                                        $es_pasado = true;
+                                    }
+                                }
+
+                                if ($es_pasado) {
+                                    $color = '#eeeeee';
+                                    $contenido = 'Pasado';
+                                } else {
+                                    $color = '#e8f5e9';
+                                    $url_reserva = add_query_arg(array(
+                                        'accion'      => 'reservar',
+                                        'fecha'       => $fecha,
+                                        'periodo'     => $pid,
+                                        'recurso'     => $rid,
+                                        'edificio_id' => $edificio_id,
+                                    ));
+                                    $contenido = '<a href="' . esc_url($url_reserva) . '">Reservar</a>';
+                                }
+                            }
+                        }
+                        ?>
+                        <td<?php echo $td_class; ?> style="background:<?php echo esc_attr($color); ?>; text-align:center;">
+                            <?php echo $contenido; ?>
+                        </td>
+                    <?php endforeach; ?>
+                </tr>
+            <?php endforeach; ?>
+        </table>
+
+        <div class="iesc-leyenda-permisos">
+            <span style="background:#ffcdd2;border:1px solid #900;padding:2px 6px;margin-right:4px;display:inline-block;"></span>
+            Recursos que tu departamento no puede reservar.
+        </div>
+    </div>
+    <?php
+    return ob_get_clean();
+}
+add_shortcode('cuadrante_reservas', 'iesc_cuadrante_shortcode');
