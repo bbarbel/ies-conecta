@@ -1,0 +1,61 @@
+<?php
+/**
+ * Bloques del plugin relacionados con la liberación automática de reservas.
+ */
+
+function iesc_cron_liberar_reservas() {
+    $mysqli = iesc_get_mysqli();
+    if (!$mysqli) {
+        wp_die('Cron: sin conexión a BBDD.');
+    }
+
+    $sql = "
+        UPDATE reservas
+        SET estado = 'liberada'
+        WHERE estado = 'pendiente'
+          AND validada_en IS NULL
+          AND expira_validacion_en IS NOT NULL
+          AND expira_validacion_en < NOW()
+    ";
+
+    $ok = $mysqli->query($sql);
+    $affected = $mysqli->affected_rows;
+    $err = $mysqli->error;
+
+    $mysqli->close();
+
+    wp_die("Cron OK=" . ($ok ? '1' : '0') . " | affected_rows=$affected | err=$err");
+}
+
+function iesc_cron_schedules($schedules) {
+    if (!isset($schedules['five_minutes'])) {
+        $schedules['five_minutes'] = array(
+            'interval' => 300,
+            'display'  => 'Cada 5 minutos (IES Conecta)'
+        );
+    }
+    return $schedules;
+}
+add_filter('cron_schedules', 'iesc_cron_schedules');
+
+function iesc_reservas_activate() {
+    if (!wp_next_scheduled('iesc_evento_liberar_reservas')) {
+        wp_schedule_event(time(), 'five_minutes', 'iesc_evento_liberar_reservas');
+    }
+}
+register_activation_hook(__FILE__, 'iesc_reservas_activate');
+
+function iesc_reservas_deactivate() {
+    wp_clear_scheduled_hook('iesc_evento_liberar_reservas');
+}
+register_deactivation_hook(__FILE__, 'iesc_reservas_deactivate');
+
+add_action('iesc_evento_liberar_reservas', 'iesc_cron_liberar_reservas');
+
+function iesc_cron_test_manual() {
+    if (isset($_GET['iesc_cron_test'])) {
+        iesc_cron_liberar_reservas();
+        wp_die('Cron de liberación ejecutado manualmente.');
+    }
+}
+add_action('init', 'iesc_cron_test_manual');
