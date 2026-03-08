@@ -1,0 +1,93 @@
+function iesc_mis_reservas_shortcode($atts) {
+    if (!is_user_logged_in()) return '<h3>Debes iniciar sesión con tu cuenta corporativa.</h3>';
+
+    $upn = iesc_get_current_upn();
+    if ($upn === '' || iesc_usuario_tiene_grupo($upn, 'GRP_ALUMNADO')) {
+        return '<h3>Esta página de reservas solo está disponible para el profesorado.</h3>';
+    }
+
+    $mysqli = iesc_get_mysqli();
+    if (!$mysqli) return 'Error de conexión con la base de datos de reservas.';
+
+    $es_jefatura = iesc_usuario_tiene_grupo($upn, 'GRP_GESTION_RESERVAS') ? true : false;
+
+    $sql = "
+        SELECT
+            r.id AS reserva_id,
+            r.usuario_id,
+            rf.fecha,
+            p.nombre AS periodo,
+            p.hora_inicio,
+            p.hora_fin,
+            rec.nombre AS recurso,
+            u.display_name AS profesor
+        FROM reservas r
+        JOIN reserva_franjas rf ON rf.reserva_id = r.id
+        JOIN recursos rec       ON rec.id       = rf.recurso_id
+        JOIN periodos p         ON p.id         = rf.periodo_id
+        JOIN usuarios_ad u      ON u.id         = r.usuario_id
+        WHERE rf.fecha >= CURDATE()
+          AND r.estado IN ('pendiente','confirmada','validada')
+    ";
+
+    if (!$es_jefatura) {
+        $sql .= " AND LOWER(u.upn) = ? ";
+    }
+
+    $sql .= " ORDER BY rf.fecha, p.id, rec.nombre";
+
+    $stmt = $mysqli->prepare($sql);
+    if (!$stmt) {
+        $mysqli->close();
+        return 'Error al preparar la consulta.';
+    }
+
+    if (!$es_jefatura) {
+        $stmt->bind_param("s", $upn);
+    }
+
+    $stmt->execute();
+    $res = $stmt->get_result();
+
+    $reservas = array();
+    while ($row = $res->fetch_assoc()) $reservas[] = $row;
+
+    $stmt->close();
+    $mysqli->close();
+
+    ob_start();
+
+    if (empty($reservas)) {
+        echo '<p>No hay reservas activas.</p>';
+    } else {
+        echo '<h3>Reservas activas</h3>';
+        echo '<table border="1" cellpadding="5" style="border-collapse:collapse;width:100%;">';
+        echo '<tr style="background:#f0f0f0;">';
+        echo '<th>Fecha</th><th>Periodo</th><th>Hora</th><th>Recurso</th>';
+        if ($es_jefatura) echo '<th>Profesor/a</th>';
+        echo '<th>Acciones</th>';
+        echo '</tr>';
+
+        foreach ($reservas as $r) {
+            echo '<tr>';
+            echo '<td>' . esc_html($r['fecha']) . '</td>';
+            echo '<td>' . esc_html($r['periodo']) . '</td>';
+            echo '<td>' . esc_html(substr($r['hora_inicio'],0,5) . ' - ' . substr($r['hora_fin'],0,5)) . '</td>';
+            echo '<td>' . esc_html($r['recurso']) . '</td>';
+            if ($es_jefatura) echo '<td>' . esc_html($r['profesor']) . '</td>';
+            echo '<td>';
+            echo '<form method="post" style="display:inline;" onsubmit="return confirm(\'¿Seguro que deseas cancelar esta reserva?\');">';
+            wp_nonce_field('iesc_borrar_reserva', 'iesc_borrar_reserva_nonce');
+            echo '<input type="hidden" name="reserva_id" value="' . (int)$r['reserva_id'] . '">';
+            echo '<button type="submit">Cancelar</button>';
+            echo '</form>';
+            echo '</td>';
+            echo '</tr>';
+        }
+
+        echo '</table>';
+    }
+
+    return ob_get_clean();
+}
+add_shortcode('mis_reservas', 'iesc_mis_reservas_shortcode');
