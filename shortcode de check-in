@@ -1,0 +1,113 @@
+function iesc_checkin_shortcode($atts) {
+
+    if (!is_user_logged_in()) {
+        return '<h3>Debes iniciar sesión para validar tu reserva.</h3>';
+    }
+
+    $upn = iesc_get_current_upn();
+    if ($upn === '' || iesc_usuario_tiene_grupo($upn, 'GRP_ALUMNADO')) {
+        return '<h3>Acceso no permitido.</h3>';
+    }
+
+    $recurso_id = isset($_GET['recurso_id']) ? (int)$_GET['recurso_id'] : 0;
+    if ($recurso_id <= 0) {
+        return '<h3>Falta recurso_id en la URL.</h3><p>Ejemplo: ?recurso_id=13</p>';
+    }
+
+    $mensaje = '';
+
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['iesc_checkin_submit'])) {
+
+        if (empty($_POST['iesc_checkin_nonce']) || !wp_verify_nonce($_POST['iesc_checkin_nonce'], 'iesc_checkin_accion')) {
+            $mensaje = '<div style="border:1px solid #f00;padding:10px;">Nonce inválido.</div>';
+        } else {
+
+            $mysqli = iesc_get_mysqli();
+            if (!$mysqli) {
+                $mensaje = '<div style="border:1px solid #f00;padding:10px;">Error de conexión con la base de datos.</div>';
+            } else {
+
+                $usuario_ad_id = iesc_get_usuario_ad_id_by_upn($mysqli, $upn);
+                if ($usuario_ad_id <= 0) {
+                    $mysqli->close();
+                    $mensaje = '<div style="border:1px solid #f00;padding:10px;">Tu usuario no está dado de alta en usuarios_ad.</div>';
+                } else {
+
+                    $fecha_hoy = iesc_today_ymd();
+                    $ahora     = iesc_now_mysql();
+
+                    $sql = "
+                        SELECT id
+                        FROM reservas
+                        WHERE recurso_id            = ?
+                          AND usuario_id            = ?
+                          AND fecha                 = ?
+                          AND estado                = 'pendiente'
+                          AND validada_en IS NULL
+                          AND expira_validacion_en IS NOT NULL
+                          AND expira_validacion_en >= ?
+                        ORDER BY expira_validacion_en ASC
+                        LIMIT 1
+                    ";
+
+                    $stmt = $mysqli->prepare($sql);
+                    if (!$stmt) {
+                        $mysqli->close();
+                        $mensaje = '<div style="border:1px solid #f00;padding:10px;">Error interno al preparar la consulta.</div>';
+                    } else {
+                        $stmt->bind_param('iiss', $recurso_id, $usuario_ad_id, $fecha_hoy, $ahora);
+                        $stmt->execute();
+                        $res = $stmt->get_result();
+                        $reserva = $res ? $res->fetch_assoc() : null;
+                        $stmt->close();
+
+                        if (!$reserva) {
+                            $mysqli->close();
+                            $mensaje = '<div style="border:1px solid #f00;padding:10px;">No se ha encontrado ninguna reserva vigente para este aula, o ha expirado la ventana de validación.</div>';
+                        } else {
+
+                            $sql2 = "UPDATE reservas SET validada_en = ?, estado = 'validada' WHERE id = ?";
+                            $stmt2 = $mysqli->prepare($sql2);
+                            if (!$stmt2) {
+                                $mysqli->close();
+                                $mensaje = '<div style="border:1px solid #f00;padding:10px;">Error interno al preparar la actualización.</div>';
+                            } else {
+                                $stmt2->bind_param('si', $ahora, $reserva['id']);
+                                $ok = $stmt2->execute();
+                                $stmt2->close();
+                                $mysqli->close();
+
+                                if ($ok) {
+                                    $mensaje = '<div style="border:1px solid #0a0;padding:10px;background:#e8f5e9;">Reserva validada correctamente.</div>';
+                                } else {
+                                    $mensaje = '<div style="border:1px solid #f00;padding:10px;">Error al validar la reserva.</div>';
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ob_start();
+    ?>
+    <div style="max-width:720px;">
+        <h3>Validación de reserva</h3>
+        <p>Aula/Recurso ID: <strong><?php echo esc_html($recurso_id); ?></strong></p>
+
+        <?php echo $mensaje; ?>
+
+        <form method="post">
+            <?php wp_nonce_field('iesc_checkin_accion', 'iesc_checkin_nonce'); ?>
+            <button type="submit" name="iesc_checkin_submit">Validar ahora</button>
+        </form>
+
+        <p style="margin-top:12px;font-size:0.95em;opacity:0.85;">
+            La validación solo funciona si tienes una reserva <strong>pendiente</strong> para hoy y dentro de la ventana permitida.
+        </p>
+    </div>
+    <?php
+    return ob_get_clean();
+}
+add_shortcode('iesc_checkin', 'iesc_checkin_shortcode');
