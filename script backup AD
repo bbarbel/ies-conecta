@@ -1,0 +1,2 @@
+C:\scripts\copiar_backup_ad.bat
+robocopy E:\WindowsImageBackup Z:\IES_Backups\AD /MIR /R:2 /W:5
