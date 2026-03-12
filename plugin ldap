@@ -1,0 +1,174 @@
+<?php
+/*
+ Plugin Name: IESC LDAP Login
+ Description: Entrar en WordPress con AD e gardar os datos en MariaDB.
+ Version: 0.2
+ Author: IES-CONECTA
+*/
+
+// DATOS DO LDAP
+define('IESC_LDAP_HOST', '172.16.10.10');
+define('IESC_LDAP_PORT', 389);
+define('IESC_LDAP_BASE_DN', 'DC=IES-CONECTA,DC=LOCAL');
+define('IESC_LDAP_DOMAIN', 'IES-CONECTA.LOCAL');
+
+// DATOS DA BASE DE DATOS MARIADB
+define('IESC_DB_HOST', '172.16.10.40');    // IP do servidor
+define('IESC_DB_USER', 'ies_user');        // o usuario
+define('IESC_DB_PASS', 'TU_PASSWORD_DB');  // o contrasinal
+define('IESC_DB_NAME', 'ies_reservas');    // nome da base de datos
+
+// Función principal para o login
+add_filter('authenticate', 'iesc_ldap_authenticate', 10, 3);
+
+function iesc_ldap_authenticate($user, $username, $password) {
+    // Se xa estamos logueados ou hai erro, non facemos nada
+    if ($user instanceof WP_User || is_wp_error($user)) {
+        return $user;
+    }
+
+    // Se falta o usuario ou o pase, fóra
+    if (empty($username) || empty($password)) {
+        return $user;
+    }
+
+    // Poñemos o dominio se non o trae
+    if (strpos($username, '@') === false) {
+        $bind_user = $username . '@' . IESC_LDAP_DOMAIN;
+    } else {
+        $bind_user = $username;
+    }
+
+    // Intentamos conectar co servidor LDAP
+    $conexion = @ldap_connect(IESC_LDAP_HOST, IESC_LDAP_PORT);
+    if (!$conexion) {
+        return $user; // Se falla, que siga o login normal de WP
+    }
+
+    ldap_set_option($conexion, LDAP_OPT_PROTOCOL_VERSION, 3);
+    ldap_set_option($conexion, LDAP_OPT_REFERRALS, 0);
+
+    // Comprobamos se o usuario e o contrasinal son correctos en AD
+    $bind_ok = @ldap_bind($conexion, $bind_user, $password);
+    if (!$bind_ok) {
+        ldap_unbind($conexion);
+        return $user; // Se non valen, que proba co login de WP
+    }
+
+    // Se chegamos aquí, o usuario é válido. Buscamos os seus datos:
+    if (!function_exists('ldap_escape')) {
+        $filter_upn = '(userPrincipalName=' . $bind_user . ')';
+    } else {
+        $filter_upn = '(userPrincipalName=' . ldap_escape($bind_user, '', LDAP_ESCAPE_FILTER) . ')';
+    }
+
+    $atributos = ['displayName', 'userPrincipalName', 'memberOf'];
+    $busqueda = @ldap_search($conexion, IESC_LDAP_BASE_DN, $filter_upn, $atributos);
+    
+    if (!$busqueda) {
+        ldap_unbind($conexion);
+        return iesc_ldap_get_or_create_wp_user($username, $username);
+    }
+
+    $entradas = ldap_get_entries($conexion, $busqueda);
+    ldap_unbind($conexion);
+
+    if ($entradas['count'] < 1) {
+        return iesc_ldap_get_or_create_wp_user($username, $username);
+    }
+
+    $entry = $entradas[0];
+    $display_name = isset($entry['displayname'][0]) ? $entry['displayname'][0] : $username;
+    $upn          = isset($entry['userprincipalname'][0]) ? $entry['userprincipalname'][0] : $bind_user;
+
+    // Sacamos os nomes dos grupos
+    $grupos_cn = [];
+    if (isset($entry['memberof']) && is_array($entry['memberof'])) {
+        $count = $entry['memberof']['count'] ?? 0;
+        for ($i = 0; $i < $count; $i++) {
+            $dn = $entry['memberof'][$i];
+            if (preg_match('/^CN=([^,]+)/', $dn, $matches)) {
+                $grupos_cn[] = $matches[1];
+            }
+        }
+    }
+
+    // 1) Gardamos todo na nosa MariaDB
+    iesc_ldap_sync_mariadb($upn, $display_name, $grupos_cn, $entry['dn']);
+
+    // 2) Creamos ou actualizamos o usuario en WordPress
+    return iesc_ldap_get_or_create_wp_user($username, $display_name, $upn);
+}
+
+// Función para xestionar o usuario dentro de WordPress
+function iesc_ldap_get_or_create_wp_user($username, $display_name, $email = '') {
+    $user = get_user_by('login', $username);
+    
+    if ($user) {
+        // Se xa existe, actualizamos os datos
+        $update_data = ['ID' => $user->ID, 'display_name' => $display_name];
+        if (!empty($email)) $update_data['user_email'] = $email;
+        wp_update_user($update_data);
+        return $user;
+    }
+
+    // Se non existe, creámolo con clave aleatoria (non se usará porque entra por LDAP)
+    if (empty($email)) $email = $username . '@example.local';
+    $random_pass = wp_generate_password(32);
+    $user_id = wp_create_user($username, $random_pass, $email);
+
+    if (is_wp_error($user_id)) return $user_id;
+
+    wp_update_user(['ID' => $user_id, 'display_name' => $display_name]);
+    $user = get_user_by('ID', $user_id);
+    $user->set_role('subscriber');
+
+    return $user;
+}
+
+// Función para sincronizar coa base de datos externa
+function iesc_ldap_sync_mariadb($upn, $display_name, array $grupos_cn, $dn_ad) {
+    $mysqli = @new mysqli(IESC_DB_HOST, IESC_DB_USER, IESC_DB_PASS, IESC_DB_NAME);
+    if ($mysqli->connect_errno) return;
+
+    $mysqli->set_charset('utf8mb4');
+
+    // Miramos se o usuario xa está na táboa
+    $usuario_id = null;
+    $stmt = $mysqli->prepare("SELECT id FROM usuarios_ad WHERE upn = ?");
+    if ($stmt) {
+        $stmt->bind_param('s', $upn);
+        $stmt->execute();
+        $stmt->bind_result($usuario_id);
+        if (!$stmt->fetch()) $usuario_id = null;
+        $stmt->close();
+    }
+
+    if ($usuario_id === null) {
+        // Se non está, metémolo (INSERT)
+        $stmt = $mysqli->prepare("INSERT INTO usuarios_ad (upn, nombre_mostrado, dn_ad, fecha_ultimo_login) VALUES (?, ?, ?, NOW())");
+        if ($stmt) {
+            $stmt->bind_param('sss', $upn, $display_name, $dn_ad);
+            $stmt->execute();
+            $usuario_id = $stmt->insert_id;
+            $stmt->close();
+        }
+    } else {
+        // Se xa está, actualizamos a última conexión (UPDATE)
+        $stmt = $mysqli->prepare("UPDATE usuarios_ad SET nombre_mostrado = ?, dn_ad = ?, fecha_ultimo_login = NOW() WHERE id = ?");
+        if ($stmt) {
+            $stmt->bind_param('ssi', $display_name, $dn_ad, $usuario_id);
+            $stmt->execute();
+            $stmt->close();
+        }
+    }
+
+    // Se non temos ID de usuario, non seguimos cos grupos
+    if (!$usuario_id) {
+        $mysqli->close();
+        return;
+    }
+
+    // Aquí iría a parte de procesar os grupos (pendente de completar se fose necesario)
+    $mysqli->close();
+}
